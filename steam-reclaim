@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Find leftover Steam data and reclaim disk. Dry-run unless --apply."""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+KEEP_APPIDS = {
+    "0",
+    "228980",  # Steamworks Common Redistributables
+}
+
+KEEP_COMMON = {
+    "steam.dll",
+    "steamworks shared",
+}
+
+
+def parse_kv(text: str) -> dict:
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"|\{|\}', text)
+    tokens = [t[1:-1].replace(r'\"', '"') if t.startswith('"') else t for t in tokens]
+
+    def read_obj(i: int) -> tuple[dict, int]:
+        obj: dict = {}
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "}":
+                return obj, i + 1
+            if tok == "{":
+                raise ValueError("unexpected {")
+            key = tok
+            i += 1
+            if i >= len(tokens):
+                obj[key] = ""
+                break
+            nxt = tokens[i]
+            if nxt == "{":
+                child, i = read_obj(i + 1)
+                obj[key] = child
+            else:
+                obj[key] = nxt
+                i += 1
+        return obj, i
+
+    if not tokens:
+        return {}
+    if tokens[0] != "{" and (len(tokens) < 2 or tokens[1] != "{"):
+        root, _ = read_obj(0)
+        return root
+    if tokens[0] != "{":
+        _, rest = tokens[0], tokens[1:]
+        if rest and rest[0] == "{":
+            obj, _ = read_obj(2)
+            return {tokens[0]: obj}
+    obj, _ = read_obj(1 if tokens[0] == "{" else 0)
+    return obj
+
+
+def load_kv_file(path: Path) -> dict:
+    try:
+        return parse_kv(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return {}
+
+
+def candidate_roots() -> list[Path]:
+    home = Path.home()
+    env = os.environ.get("STEAM_PATH") or os.environ.get("STEAM_DIR")
+    out: list[Path] = []
+    guessed = [
+        Path(env) if env else None,
+        home / ".local/share/Steam",
+        home / ".steam/steam",
+        home / ".steam/root",
+        home / ".var/app/com.valvesoftware.Steam/data/Steam",
+        Path.home() / "Library/Application Support/Steam",
+        Path("C:/Program Files (x86)/Steam"),
+        Path("C:/Program Files/Steam"),
+    ]
+    for p in guessed:
+        if p is None:
+            continue
+        p = p.expanduser()
+        if (p / "steamapps").is_dir() and p not in out:
+            out.append(p)
+        elif (p / "steam" / "steamapps").is_dir() and (p / "steam") not in out:
+            out.append(p / "steam")
+    return out
+
+
+def library_paths(steam_root: Path) -> list[Path]:
+    vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+    paths = [steam_root]
+    data = load_kv_file(vdf)
+    folders = data.get("libraryfolders", data)
+    if isinstance(folders, dict):
+        for key, val in folders.items():
+            if key in {"contentstatsid"}:
+                continue
+            if isinstance(val, dict) and val.get("path"):
+                paths.append(Path(val["path"]))
+            elif isinstance(val, str) and key.isdigit():
+                paths.append(Path(val))
+    uniq: list[Path] = []
+    for p in paths:
+        p = Path(str(p).replace("\\\\", "\\")).expanduser()
+        if p not in uniq and (p / "steamapps").is_dir():
+            uniq.append(p)
+    return uniq
+
+
+@dataclass
+class Installed:
+    appid: str
+    name: str
+    installdir: str
+    library: Path
+
+
+def installed_apps(libraries: list[Path]) -> list[Installed]:
+    found: list[Installed] = []
+    for lib in libraries:
+        apps = lib / "steamapps"
+        for acf in apps.glob("appmanifest_*.acf"):
+            data = load_kv_file(acf)
+            state = data.get("AppState", data)
+            if not isinstance(state, dict):
+                continue
+            appid = str(state.get("appid") or acf.stem.split("_")[-1])
+            name = str(state.get("name") or "")
+            installdir = str(state.get("installdir") or "")
+            found.append(Installed(appid, name, installdir, lib))
+    return found
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            fp = Path(root) / name
+            try:
+                if fp.is_symlink():
+                    continue
+                total += fp.stat().st_size
+            except OSError:
+                pass
+        dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+    return total
+
+
+def human(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} B"
+
+
+@dataclass
+class Orphan:
+    kind: str
+    path: Path
+    reason: str
+    bytes: int
+
+
+def find_orphans(libraries: list[Path], apps: list[Installed]) -> list[Orphan]:
+    appids = {a.appid for a in apps} | KEEP_APPIDS
+    installdirs = {}
+    for a in apps:
+        if a.installdir:
+            installdirs.setdefault(a.library.resolve(), set()).add(a.installdir.lower())
+
+    orphans: list[Orphan] = []
+    for lib in libraries:
+        apps_dir = lib / "steamapps"
+        common = apps_dir / "common"
+        owned = installdirs.get(lib.resolve(), set())
+        if common.is_dir():
+            for child in common.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name.lower() in KEEP_COMMON:
+                    continue
+                if child.name.lower() in owned:
+                    continue
+                orphans.append(
+                    Orphan(
+                        "common",
+                        child,
+                        "no installed game uses this folder",
+                        dir_size(child),
+                    )
+                )
+        for bucket, label, reason in (
+            (apps_dir / "compatdata", "compatdata", "Proton prefix for an uninstalled app"),
+            (apps_dir / "shadercache", "shadercache", "shader cache for an uninstalled app"),
+        ):
+            if not bucket.is_dir():
+                continue
+            for child in bucket.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name not in appids and child.name.isdigit():
+                    orphans.append(Orphan(label, child, reason, dir_size(child)))
+    orphans.sort(key=lambda o: o.bytes, reverse=True)
+    return orphans
+
+
+def print_table(orphans: list[Orphan]) -> None:
+    if not orphans:
+        print("Nothing leftover. Steam is clean.")
+        return
+    kind_w = max(len(o.kind) for o in orphans + [Orphan("kind", Path("."), "", 0)])
+    size_w = max(len(human(o.bytes)) for o in orphans)
+    print(f"{'SIZE':>{size_w}}  {'TYPE':<{kind_w}}  PATH")
+    print(f"{'-'*size_w}  {'-'*kind_w}  {'-'*40}")
+    for o in orphans:
+        print(f"{human(o.bytes):>{size_w}}  {o.kind:<{kind_w}}  {o.path}")
+    total = sum(o.bytes for o in orphans)
+    print()
+    print(f"{len(orphans)} leftover path(s) · {human(total)} reclaimable")
+
+
+def apply(orphans: list[Orphan], yes: bool) -> int:
+    if not orphans:
+        return 0
+    total = sum(o.bytes for o in orphans)
+    if not yes:
+        print(f"Delete {len(orphans)} path(s) ({human(total)})? [y/N] ", end="", flush=True)
+        ans = sys.stdin.readline().strip().lower()
+        if ans not in {"y", "yes"}:
+            print("aborted")
+            return 1
+    failed = 0
+    for o in orphans:
+        try:
+            shutil.rmtree(o.path)
+            print(f"removed {o.path}")
+        except OSError as exc:
+            print(f"failed {o.path}: {exc}", file=sys.stderr)
+            failed += 1
+    return 1 if failed else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="steam-reclaim",
+        description="Find leftover Steam game folders, Proton prefixes, and shader caches.",
+    )
+    parser.add_argument("--steam", type=Path, help="Steam root (otherwise auto-detect)")
+    parser.add_argument("--apply", action="store_true", help="delete leftovers (asks first)")
+    parser.add_argument("-y", "--yes", action="store_true", help="do not ask before --apply")
+    args = parser.parse_args()
+
+    roots = [args.steam] if args.steam else candidate_roots()
+    if not roots:
+        print("Steam not found. Set STEAM_PATH or pass --steam /path/to/Steam", file=sys.stderr)
+        return 2
+
+    libraries: list[Path] = []
+    for root in roots:
+        for lib in library_paths(root):
+            if lib not in libraries:
+                libraries.append(lib)
+
+    print("Libraries")
+    for lib in libraries:
+        print(f"  {lib}")
+    print()
+
+    apps = installed_apps(libraries)
+    print(f"Installed apps: {len(apps)}")
+    print()
+
+    orphans = find_orphans(libraries, apps)
+    print_table(orphans)
+    if args.apply:
+        print()
+        return apply(orphans, args.yes)
+    if orphans:
+        print()
+        print("Delete nothing yet. Re-run with --apply to reclaim.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
